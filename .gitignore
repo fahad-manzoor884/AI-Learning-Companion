@@ -1,1 +1,8 @@
 .env
+*.pt
+*.safetensors
+*.jpg
+*.jpeg
+runs/
+final_student_report.json
+
