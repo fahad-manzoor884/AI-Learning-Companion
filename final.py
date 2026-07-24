@@ -83,7 +83,7 @@ def run_vision_pipeline(image_path):
         print(f"❌ ERROR: Could not read image at '{image_path}'. Check the path/filename.")
         return []
 
-    results = yolo_model.predict(source=image_path, conf=0.30, verbose=False)
+    results = yolo_model.predict(source=image_path, conf=0.20, iou=0.7, verbose=False)
 
     all_mcqs_text = []
 
@@ -156,7 +156,7 @@ def get_groq_evaluation(all_mcqs_text):
     1. SCATTERED OCR DATA (CRITICAL): The OCR list is not always in perfect order. It may contain full questions and isolated text snippets. The isolated snippets represent the student's selected answers.
     2. DETECTIVE MAPPING (UNIVERSAL LOGIC): Logically match every isolated snippet to its corresponding question using text similarity and option letters (A, B, C, D). Even if there are OCR typos, link it to the closest matching option.
     3. STRICT FAITHFUL EXTRACTION: Extract exactly what the student selected, even if it has typos. Just autocorrect the typos (not answer) and write it in student_selected.
-    4. MISSING ANSWERS: If no answer is found for a question in the list, write "Not Detected by OCR". If no option is given for a question, then do not write it in JSON also If only options are written and the question is not written then also do not write it in JSON.
+    4. INCOMPLETE DATA REJECTION: If the OCR text contains ONLY options (no question) or ONLY a question (no options), IGNORE IT completely. Do NOT guess or hallucinate missing text. Do NOT include it in the JSON output.
     5. CORRECT ANSWER: Provide the universally accepted correct answer based on Computer Science domain knowledge.
     6. SMART GRADING: If the student's selection logically matches the correct answer (ignoring minor OCR typos), the status is "Correct" (Marks: 1). Otherwise, "Incorrect" (Marks: 0).
 
@@ -305,12 +305,40 @@ def add_confidence_checks(evaluated_json):
     return evaluated_json
 
 
-def detect_weakness_topic(question_text):
-    inputs = tokenizer(question_text, return_tensors="pt", truncation=True, padding=True)
-    with torch.no_grad():
-        outputs = distilbert_model(**inputs)
-        predicted_class_id = torch.argmax(outputs.logits, dim=1).item()
-    return encoder.inverse_transform([predicted_class_id])[0]
+def batch_detect_weakness_topics(incorrect_questions):
+    """
+    Takes a list of question texts and returns a dictionary mapping 
+    each question to its classified topic in ONE single API call.
+    """
+    valid_topics = [
+        "Operating Systems", "Database Systems", "Computer Networks", 
+        "Web Development", "Artificial Intelligence", "Information Security", 
+        "Software Engineering", "Data Structures" , " Object-Oriented Programming" , "Compiler Design", "Cloud Computing", "Functional Programming"
+    ]
+    
+    prompt = f"""
+    Classify the following Computer Science questions into EXACTLY ONE topic from the list below.
+    Valid Topics: {', '.join(valid_topics)}
+    
+    Questions List:
+    {json.dumps(incorrect_questions, indent=2)}
+    
+    CRITICAL: Respond ONLY with a valid JSON dictionary where the key is the exact question text, and the value is the exact topic name. Do NOT add markdown blocks.
+    """
+    
+    try:
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[{"role": "user", "content": prompt}],
+            temperature=0.0
+        )
+        raw_output = response.choices[0].message.content
+        return extract_json(raw_output, expect="object")
+            
+    except Exception as e:
+        print(f"❌ Batch Classification Error: {e}")
+        # Fallback dictionary if API fails
+        return {q: "General Computer Science" for q in incorrect_questions}
 
 
 # ==========================================
@@ -347,7 +375,7 @@ def get_intent(student_input):
 
 
 def teach_topic(topic, attempt, student_message="", failed_concepts_context=""):
-    """Teaching function adapted for Micro-Topics and Advanced University-Level Depth"""
+    """Teaching function adapted for Micro-Topics with Easy-to-Understand Depth"""
 
     context_instruction = ""
     if failed_concepts_context:
@@ -355,7 +383,7 @@ def teach_topic(topic, attempt, student_message="", failed_concepts_context=""):
         CRITICAL CONTEXT: The student failed the following specific questions in the domain of '{topic}':
         {failed_concepts_context}
 
-        YOUR TASK: DO NOT teach the broad subject of '{topic}'. Analyze the failed questions, extract the EXACT specific micro-concepts/sub-topics they cover (e.g., if the question is about 'ReLU', teach ONLY Activation Functions, not the whole Neural Network history), and teach ONLY those specific weak areas.
+        YOUR TASK: DO NOT teach the broad subject of '{topic}'. Analyze the failed questions, extract the EXACT specific micro-concepts/sub-topics they cover, and teach ONLY those specific weak areas.
         """
 
     interaction_context = ""
@@ -364,27 +392,34 @@ def teach_topic(topic, attempt, student_message="", failed_concepts_context=""):
         The student just said this to you: "{student_message}"
 
         YOUR IMMEDIATE REACTION RULES:
-        1. IF ABUSIVE: If the student uses profanity or disrespects you, SCOLD THEM HARSHLY like a strict professor.
-        2. IF OFF-TOPIC: Firmly tell them to focus on the current topic first.
-        3. IF VALID DOUBT: Address their specific confusion deeply.
+        1. IF ABUSIVE: Tell them gently but firmly to keep it professional.
+        2. IF OFF-TOPIC: Remind them to focus on the current topic first.
+        3. IF VALID DOUBT: Address their specific confusion using a simple real-world analogy.
         """
 
     if attempt == 1:
-        instructions = "Provide a highly structured, ADVANCED UNIVERSITY-LEVEL Concept Map for the specific sub-topics extracted from the failed questions. Use headings, bullet points, and include deep technical mechanics. Do not give basic definitions. End by asking: 'Do you have any specific doubts, or are you ready for the advanced quiz?'"
+        instructions = "Provide a clean, easy-to-read Concept Map for the specific sub-topics extracted from the failed questions. Use simple headings and bullet points. Explain the core mechanics using everyday analogies (like a restaurant, traffic, filing cabinet, etc.). Do NOT use dense academic jargon. End by asking: 'Does this make sense, or do you have any specific doubts before we start the quiz?'"
     elif attempt == 2:
-        instructions = "Address the student's message directly. Provide a HIGHLY DETAILED, ADVANCED EXPLANATION. Explain the 'Why' and 'How' at an engineering level (including architecture, edge cases, or mathematical intuition if applicable) so they are prepared for a difficult exam. End by asking: 'Do you have any MORE doubts, or should I generate the quiz now?'"
+        instructions = "Address the student's message directly. Explain the 'Why' and 'How' deeply but in VERY SIMPLE English. Break down any complex engineering terms into plain words. End by asking: 'Do you have any MORE doubts, or should we jump into the quiz?'"
     else:
-        instructions = "The student failed the mock quiz. Provide a FINAL, definitive explanation using an ADVANCED REAL-WORLD SYSTEM ARCHITECTURE as an example (e.g., how this sub-topic is actually used in production software). Focus exclusively on fixing their advanced mistakes. IMPORTANT: Do NOT ask any questions at the end. Conclude firmly."
+        instructions = "The student failed the mock quiz. Provide a FINAL, definitive explanation using a VERY SIMPLE REAL-WORLD SYSTEM ARCHITECTURE as an example (e.g., how this is used in an everyday app like WhatsApp, an ATM, or an online store). Focus exclusively on fixing their mistakes. IMPORTANT: Do NOT ask any questions at the end. Conclude with an encouraging remark."
 
     prompt = f"""
-    You are an expert, highly strict, and brilliant University Computer Science Professor teaching final-year engineering students.
+    You are a highly skilled but very friendly Senior Software Engineer mentoring a final-semester Computer Science student.
     Broad Domain: {topic}
     {context_instruction}
     {interaction_context}
 
+    YOUR TEACHING STYLE & LANGUAGE RULES (CRITICAL):
+    1. EXTREME SIMPLICITY: You MUST write in basic, conversational, everyday English. Speak as if you are explaining a concept to a junior developer over a cup of coffee.
+    2. DEEP BUT ACCESSIBLE: Explain the core technical mechanics deeply, but WITHOUT using overly complex academic jargon. 
+    3. BAN POST-GRAD JARGON: Do NOT use extreme terminology unless absolutely necessary. If you must use a technical term, you MUST instantly explain it in plain words.
+    4. USE ANALOGIES: Always use relatable, real-world analogies.
+    5. VISUAL STRUCTURE: Keep paragraphs very short. Use simple bullet points. Do not create massive, intimidating tables.
+
     Instructions: {instructions}
 
-    CRITICAL RULE: Respond COMPLETELY in English. Teach at an ADVANCED level. Maintain your strict professor persona at all times.
+    CRITICAL RULE: Respond COMPLETELY in simple English. Maintain your friendly, mentor-like persona. Never sound like a strict academic textbook.
     """
 
     try:
@@ -397,7 +432,6 @@ def teach_topic(topic, attempt, student_message="", failed_concepts_context=""):
     except Exception as e:
         print(f"\n[DEBUG: teach_topic Groq call failed: {e}]")
         return "⚠️ Tutor is temporarily unavailable (API error). Please try again."
-
 
 def generate_mock_quiz(topic, failed_concepts_context=""):
     """Generates 10 Advanced Questions based strictly on what was just taught"""
@@ -446,7 +480,7 @@ def generate_mock_quiz(topic, failed_concepts_context=""):
 # ==========================================
 if __name__ == "__main__":
 
-    test_image = 'T3.jpeg'  # Apni image ka naam lagao
+    test_image = 'T5.jpeg'  # Apni image ka naam lagao
 
     raw_mcqs = run_vision_pipeline(test_image)
     if not raw_mcqs:
@@ -461,18 +495,33 @@ if __name__ == "__main__":
     # ---- NEW: Supervisor's required LLM accuracy/confidence check ----
     evaluated_data = add_confidence_checks(evaluated_data)
 
-    print("\n--- 🔍 DETECTING MICRO-WEAKNESSES ---")
+    # ... (OCR and Evaluation logic here) ...
+
+    print("\n--- 🔍 DETECTING MICRO-WEAKNESSES (BATCH MODE) ---")
     weak_topics_dict = {}
-
-    for item in evaluated_data:
-        topic = detect_weakness_topic(item.get("question_text", ""))
-        item["weakness_topic"] = topic
-
-        if str(item.get("status", "")).strip().lower() == "incorrect":
-            print(f"🚨 WEAKNESS DETECTED -> Question: {item.get('question_no', '?')} | Topic: {topic}")
-            if topic not in weak_topics_dict:
-                weak_topics_dict[topic] = []
-            weak_topics_dict[topic].append(item.get("question_text", ""))
+    
+    # Step 1: Sirf un questions ko filter karo jo galat hain
+    incorrect_questions = [
+        item.get("question_text", "") 
+        for item in evaluated_data 
+        if str(item.get("status", "")).strip().lower() == "incorrect" and item.get("question_text")
+    ]
+    
+    if incorrect_questions:
+        # Step 2: Ek hi call mein saare topics mangwa lo
+        topic_mapping = batch_detect_weakness_topics(incorrect_questions)
+        
+        # Step 3: Apne data ko update karo
+        for item in evaluated_data:
+            q_text = item.get("question_text", "")
+            if q_text in topic_mapping:
+                topic = topic_mapping[q_text]
+                item["weakness_topic"] = topic
+                print(f"🚨 WEAKNESS DETECTED -> Question: {item.get('question_no', '?')} | Topic: {topic}")
+                
+                if topic not in weak_topics_dict:
+                    weak_topics_dict[topic] = []
+                weak_topics_dict[topic].append(q_text)
 
     output_filename = 'final_student_report.json'
     with open(output_filename, 'w') as f:
